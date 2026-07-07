@@ -169,3 +169,112 @@ def top_terms(df: pd.DataFrame, label: str = "Negative", n: int = 15) -> list[tu
         words = re.findall(r"[a-zA-Z']{3,}", t.lower())
         counter.update(w for w in words if w not in _STOPWORDS)
     return counter.most_common(n)
+
+
+# ------------------------------------------------------- Brand relevance filter
+
+# Words that signal someone is talking about a software product, not using the
+# brand name as an ordinary English word.
+PRODUCT_CONTEXT = [
+    "app", "apps", "tool", "software", "product", "platform", "workspace",
+    "template", "templates", "subscription", "pricing", "plan", "account",
+    "login", "sync", "api", "feature", "features", "update", "release",
+    "download", "install", "installed", "desktop", "mobile", "widget",
+    "integration", "database", "review", "alternative", "alternatives",
+    "vs", "versus", "saas", "startup", "user", "users", "free tier",
+    "premium", "browser", "extension", "export", "import", "beta",
+]
+
+# Determiner + brand means the word is being used generically:
+# "the notion of", "no notion that", "some notion about"
+_GENERIC_DETERMINERS = r"(the|a|an|any|no|every|some|this|that|his|her|their|my|your|our|such)"
+
+
+def _theme_words() -> set[str]:
+    words = set()
+    for kws in THEMES.values():
+        words.update(kws)
+    return words
+
+
+_THEME_WORDS = _theme_words()
+
+
+def _brand_relevance(text: str, brand: str, url: str = "") -> tuple[int, bool]:
+    """Score how likely a text is about the brand rather than the English word.
+
+    Returns (score, has_brand_signal). Brand signals are usages that only make
+    sense for the product: its domain, its name as a proper noun, or a link
+    into its own community (e.g. reddit.com/r/notion).
+    """
+    low = " " + text.lower() + " "
+    b = re.escape(brand.lower())
+    score = 0
+    brand_signal = False
+
+    # the brand's website is the strongest possible signal
+    if re.search(rf"\b{b}\.(so|com|io|app|ai|co|dev|org)\b", low):
+        score += 2
+        brand_signal = True
+
+    # link into the brand's own community or store page
+    if url and brand.lower() in url.lower():
+        score += 2
+        brand_signal = True
+
+    # brand written as a proper noun (capitalized) in or at the start of a sentence
+    cap = " ".join(p.capitalize() for p in brand.split())
+    for m in re.finditer(rf"\b{re.escape(cap)}\b", text):
+        prev = text[:m.start()].rstrip()
+        if not prev or prev[-1] not in ".!?\"'“”‘’:;([-":
+            score += 1
+            brand_signal = True
+            break
+
+    # product vocabulary nearby
+    if any(re.search(rf"\b{re.escape(w)}\b", low) for w in PRODUCT_CONTEXT):
+        score += 1
+
+    # feedback vocabulary (crash, slow, refund, ...) implies product talk
+    if any(w in low for w in _THEME_WORDS):
+        score += 1
+
+    # generic-English usage patterns count against
+    if re.search(rf"\b{_GENERIC_DETERMINERS}\s+{b}\b", low):
+        score -= 2
+    if re.search(rf"\b{b}\s+(of|that|to)\b", low):
+        score -= 1
+
+    return score, brand_signal
+
+
+def filter_brand_mentions(df: pd.DataFrame, brand: str):
+    """Split fetched mentions into (relevant, dropped_count) for a brand keyword.
+
+    Adaptive strictness: when the corpus shows the keyword being used as an
+    ordinary English word (like "notion"), require a real brand signal and a
+    higher score. Unambiguous brands (like "spotify") pass with a light touch.
+    App store reviews are on-brand by definition; do not pass them through.
+    """
+    brand = brand.strip()
+    if df.empty or not brand:
+        return df, 0
+
+    b = re.escape(brand.lower())
+    scored = [
+        _brand_relevance(str(row["text"]), brand, str(row.get("url", "")))
+        for _, row in df.iterrows()
+    ]
+
+    # How often is the keyword used as plain English in this batch?
+    generic_pat = rf"\b{_GENERIC_DETERMINERS}\s+{b}\b|\b{b}\s+(of|that|to)\b"
+    generic_share = df["text"].astype(str).map(
+        lambda t: bool(re.search(generic_pat, t.lower()))).mean()
+    signal_share = sum(1 for _, sig in scored if sig) / len(scored)
+    ambiguous = generic_share > 0.12 or signal_share < 0.15
+
+    if ambiguous:
+        mask = pd.Series([s >= 2 and sig for s, sig in scored], index=df.index)
+    else:
+        mask = pd.Series([s >= 1 for s, _ in scored], index=df.index)
+    return df[mask].reset_index(drop=True), int((~mask).sum())

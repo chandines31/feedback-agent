@@ -21,7 +21,8 @@ import streamlit as st
 
 import sources
 from analysis import (JOURNEY_ORDER, add_journey, add_sentiment, add_themes,
-                      journey_summary, theme_summary, top_terms)
+                      filter_brand_mentions, journey_summary, theme_summary,
+                      top_terms)
 from roadmap import build_roadmap
 
 st.set_page_config(page_title="Feedback Agent", page_icon="📡", layout="wide")
@@ -191,6 +192,9 @@ picked = st.sidebar.multiselect("Social sources", SOCIAL_SOURCES,
 with st.sidebar.expander("Search options"):
     rd_sub = st.text_input("Limit Reddit to subreddit (optional)", placeholder="notion")
     per_source = st.slider("Max mentions per source", 25, 100, 50, 25)
+    strict = st.toggle("Strict brand matching", value=True,
+                       help="Drops posts that use your keyword as an ordinary word "
+                            "(e.g. 'the notion of...') instead of talking about the product.")
 
 if st.sidebar.button("Pull social mentions", type="primary",
                      use_container_width=True, disabled=not (keyword and picked)):
@@ -201,15 +205,22 @@ if st.sidebar.button("Pull social mentions", type="primary",
         "Google News": lambda: sources.fetch_google_news(keyword, per_source),
         "Stack Overflow": lambda: sources.fetch_stackoverflow(keyword, per_source),
     }
-    results, failures = [], []
+    results, failures, off_topic = [], [], 0
     with st.spinner("Listening across sources..."):
         for name in picked:
             try:
-                n = ingest(fetchers[name]())
+                fetched = fetchers[name]()
+                if strict:
+                    fetched, dropped = filter_brand_mentions(fetched, keyword)
+                    off_topic += dropped
+                n = ingest(fetched)
                 results.append(f"{name} {n}")
             except Exception:
                 failures.append(name)
-    st.sidebar.success("New mentions: " + ", ".join(results))
+    msg = "New mentions: " + ", ".join(results)
+    if off_topic:
+        msg += f" ({off_topic} off-topic dropped)"
+    st.sidebar.success(msg)
     if failures:
         st.sidebar.warning("No data from: " + ", ".join(failures))
 
