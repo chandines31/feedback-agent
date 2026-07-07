@@ -1,8 +1,17 @@
 # Feedback Agent
 
-A free **social-listening tool for product teams**. Track a brand across every
-channel customers talk on, analyze the conversation automatically, and get a
-prioritized roadmap for the week.
+A free **social-listening tool for product teams**. Name your brand once: the
+app finds its Google Play and App Store listings, pulls social mentions and
+app reviews together, analyzes the conversation automatically, and hands you
+a prioritized roadmap for the week.
+
+## How it works
+
+1. **Your brand**: type a name or website (e.g. `notion.so`)
+2. **Confirm and launch**: the detected app store listings and social channels
+   are shown for confirmation; adjust anything, then start listening
+3. **Dashboard**: journey funnel, pain themes, sentiment trend, mentions feed
+   and a Mon-Fri roadmap, all from one click. Refresh any time from the sidebar.
 
 ## Sources
 

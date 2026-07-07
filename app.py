@@ -1,10 +1,11 @@
 """Feedback Agent: a social-listening tool that gives product managers
 a weekly roadmap.
 
-Tracks a brand across Reddit, Hacker News, Bluesky, Google News and
-Stack Overflow, pulls app reviews from Google Play and the App Store,
-accepts Excel/CSV uploads, analyzes sentiment, pain themes and journey
-stage locally (no paid APIs), and turns it all into a prioritized
+One onboarding step: name your brand. The app finds its Google Play and
+App Store listings, asks you to confirm, then pulls social mentions
+(Reddit, Hacker News, Bluesky, Google News, Stack Overflow) and app
+reviews together, analyzes sentiment, pain themes and journey stage
+locally (no paid APIs), and turns it all into a prioritized
 Monday-Friday action plan.
 
 Run locally:   streamlit run app.py
@@ -98,12 +99,25 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 .quote { border-left: 3px solid #e5e7eb; padding: 4px 12px; margin: 8px 0 0 0;
          font-size: 13px; color: #6b7280; font-style: italic; line-height: 1.5; }
 
-.empty-step { display: flex; gap: 14px; align-items: baseline; padding: 10px 0;
-              border-bottom: 1px solid #f3f4f6; }
-.empty-step:last-child { border-bottom: none; }
-.step-num { min-width: 26px; height: 26px; border-radius: 999px; background: #eff6ff;
-            color: #1d4ed8; font-weight: 700; font-size: 13px; text-align: center;
-            line-height: 26px; }
+/* onboarding */
+.hero-title { font-size: 34px; font-weight: 800; color: #111827;
+              letter-spacing: -0.03em; line-height: 1.15; }
+.hero-sub { font-size: 16px; color: #6b7280; margin-top: 6px; }
+.feature { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px;
+           padding: 18px 20px; height: 100%; }
+.feature-num { font-size: 12px; font-weight: 700; color: #2563eb;
+               letter-spacing: 0.06em; text-transform: uppercase; }
+.feature-title { font-size: 15px; font-weight: 700; color: #111827; margin: 4px 0 4px 0; }
+.feature-body { font-size: 13px; color: #6b7280; line-height: 1.5; }
+.stepper { font-size: 13px; color: #9ca3af; font-weight: 600; margin-bottom: 8px; }
+.stepper b { color: #2563eb; }
+.store-hit { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px;
+             padding: 8px 12px; font-size: 13px; color: #166534; margin-bottom: 6px; }
+.store-miss { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px;
+              padding: 8px 12px; font-size: 13px; color: #6b7280; margin-bottom: 6px; }
+.brand-chip { display: inline-block; padding: 4px 14px; border-radius: 999px;
+              background: #eff6ff; color: #1d4ed8; font-weight: 700; font-size: 14px;
+              border: 1px solid #bfdbfe; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -157,6 +171,12 @@ if "feedback" not in st.session_state:
     st.session_state.feedback = pd.DataFrame(columns=sources.COLUMNS)
 if "ai_roadmap" not in st.session_state:
     st.session_state.ai_roadmap = None
+if "ob" not in st.session_state:
+    st.session_state.ob = {"step": 1}          # onboarding state
+if "config" not in st.session_state:
+    st.session_state.config = None             # saved tracking setup
+if "pull_msg" not in st.session_state:
+    st.session_state.pull_msg = None
 
 
 def ingest(df: pd.DataFrame) -> int:
@@ -175,6 +195,50 @@ def ingest(df: pd.DataFrame) -> int:
     return len(combined) - before
 
 
+def pull_everything(cfg: dict) -> str:
+    """Pull all configured channels (social + app stores). Returns a summary."""
+    kw = cfg["keyword"]
+    fetchers = {
+        "Reddit": lambda: sources.fetch_reddit(kw, cfg["limit"], cfg.get("subreddit", "")),
+        "Hacker News": lambda: sources.fetch_hackernews(kw, cfg["limit"]),
+        "Bluesky": lambda: sources.fetch_bluesky(kw, cfg["limit"]),
+        "Google News": lambda: sources.fetch_google_news(kw, cfg["limit"]),
+        "Stack Overflow": lambda: sources.fetch_stackoverflow(kw, cfg["limit"]),
+    }
+    results, failures, off_topic = [], [], 0
+    for name in cfg["sources"]:
+        try:
+            fetched = fetchers[name]()
+            if cfg.get("strict", True):
+                fetched, dropped = filter_brand_mentions(fetched, kw)
+                off_topic += dropped
+            results.append(f"{name} {ingest(fetched)}")
+        except Exception:
+            failures.append(name)
+    if cfg.get("gp_id"):
+        try:
+            n = ingest(sources.fetch_google_play(cfg["gp_id"], 200))
+            (results if n else failures).append(f"Google Play {n}" if n else "Google Play")
+        except Exception:
+            failures.append("Google Play")
+    if cfg.get("as_id"):
+        try:
+            n = ingest(sources.fetch_app_store(cfg["as_id"], cfg.get("country", "us")))
+            (results if n else failures).append(f"App Store {n}" if n else "App Store")
+        except Exception:
+            failures.append("App Store")
+
+    msg = "New mentions: " + ", ".join(results) if results else "No new mentions found"
+    if off_topic:
+        msg += f" ({off_topic} off-topic dropped)"
+    if failures:
+        msg += ". No data from: " + ", ".join(failures)
+    return msg
+
+
+df = st.session_state.feedback
+cfg = st.session_state.config
+
 # ------------------------------------------------------------------ sidebar
 
 st.sidebar.markdown(
@@ -184,109 +248,179 @@ st.sidebar.markdown(
     '<div class="app-sub">Social listening for product teams</div></div>',
     unsafe_allow_html=True)
 
-st.sidebar.markdown('<div class="side-label">Track a brand</div>', unsafe_allow_html=True)
-keyword = st.sidebar.text_input("Brand or product keyword", placeholder="e.g. Notion",
-                                label_visibility="collapsed")
-picked = st.sidebar.multiselect("Social sources", SOCIAL_SOURCES,
-                                default=["Reddit", "Hacker News", "Bluesky", "Google News"])
-with st.sidebar.expander("Search options"):
-    rd_sub = st.text_input("Limit Reddit to subreddit (optional)", placeholder="notion")
-    per_source = st.slider("Max mentions per source", 25, 100, 50, 25)
-    strict = st.toggle("Strict brand matching", value=True,
-                       help="Drops posts that use your keyword as an ordinary word "
-                            "(e.g. 'the notion of...') instead of talking about the product.")
+if cfg:
+    st.sidebar.markdown('<div class="side-label">Tracking</div>', unsafe_allow_html=True)
+    st.sidebar.markdown(f'<span class="brand-chip">{html.escape(cfg["keyword"])}</span>',
+                        unsafe_allow_html=True)
+    channels = list(cfg["sources"])
+    if cfg.get("gp_id"):
+        channels.append("Google Play")
+    if cfg.get("as_id"):
+        channels.append("App Store")
+    st.sidebar.caption(f"{len(channels)} channels · {len(df)} mentions collected")
 
-if st.sidebar.button("Pull social mentions", type="primary",
-                     use_container_width=True, disabled=not (keyword and picked)):
-    fetchers = {
-        "Reddit": lambda: sources.fetch_reddit(keyword, per_source, rd_sub),
-        "Hacker News": lambda: sources.fetch_hackernews(keyword, per_source),
-        "Bluesky": lambda: sources.fetch_bluesky(keyword, per_source),
-        "Google News": lambda: sources.fetch_google_news(keyword, per_source),
-        "Stack Overflow": lambda: sources.fetch_stackoverflow(keyword, per_source),
-    }
-    results, failures, off_topic = [], [], 0
-    with st.spinner("Listening across sources..."):
-        for name in picked:
+    if st.sidebar.button("Refresh data", type="primary", use_container_width=True):
+        with st.spinner("Listening across your channels..."):
+            st.session_state.pull_msg = pull_everything(cfg)
+        st.rerun()
+
+    if st.sidebar.button("Track a different brand", use_container_width=True):
+        st.session_state.feedback = pd.DataFrame(columns=sources.COLUMNS)
+        st.session_state.config = None
+        st.session_state.ob = {"step": 1}
+        st.session_state.ai_roadmap = None
+        st.rerun()
+
+    with st.sidebar.expander("Add an Excel / CSV file"):
+        st.caption("Any file with a feedback or review text column. Date, rating and author are auto-detected.")
+        uploaded = st.file_uploader("Choose file", type=["xlsx", "xls", "csv"],
+                                    label_visibility="collapsed")
+        if uploaded and st.button("Import file", use_container_width=True):
             try:
-                fetched = fetchers[name]()
-                if strict:
-                    fetched, dropped = filter_brand_mentions(fetched, keyword)
-                    off_topic += dropped
-                n = ingest(fetched)
-                results.append(f"{name} {n}")
-            except Exception:
-                failures.append(name)
-    msg = "New mentions: " + ", ".join(results)
-    if off_topic:
-        msg += f" ({off_topic} off-topic dropped)"
-    st.sidebar.success(msg)
-    if failures:
-        st.sidebar.warning("No data from: " + ", ".join(failures))
+                n = ingest(sources.load_upload(uploaded))
+                st.success(f"Imported {n} items")
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+else:
+    st.sidebar.caption("Set up tracking to start listening. It takes under a minute.")
 
-st.sidebar.markdown('<div class="side-label">App store reviews</div>', unsafe_allow_html=True)
-with st.sidebar.expander("Google Play and App Store"):
-    brand_q = st.text_input("Brand name or website", placeholder="notion.so",
-                            help="Type the product name or its website and the app ids are looked up for you.")
-    if st.button("Find app ids", use_container_width=True, disabled=not brand_q):
-        with st.spinner("Searching both app stores..."):
-            found = sources.find_apps(brand_q)
-        st.session_state["gp_id"] = (found["google_play"] or {}).get("id", "")
-        st.session_state["as_id"] = (found["app_store"] or {}).get("id", "")
-        st.session_state["app_matches"] = found
+# ------------------------------------------------------------------ onboarding
 
-    matches = st.session_state.get("app_matches")
-    if matches:
-        gp_m, as_m = matches["google_play"], matches["app_store"]
-        st.caption("Google Play: " + (f"{gp_m['title']} by {gp_m['developer']}" if gp_m else "no app found"))
-        st.caption("App Store: " + (f"{as_m['title']} by {as_m['developer']}" if as_m else "no app found"))
-        if gp_m or as_m:
-            st.caption("Check the ids below look right, then pull.")
+if df.empty and not cfg:
+    ob = st.session_state.ob
 
-    gp_id = st.text_input("Google Play package id", key="gp_id", placeholder="notion.id",
-                          help="From the Play Store URL: play.google.com/store/apps/details?id=<this>")
-    as_id = st.text_input("App Store numeric id", key="as_id", placeholder="1232780281",
-                          help="The number in the App Store URL: apps.apple.com/us/app/.../id<this>")
-    as_country = st.text_input("Country code", value="us", max_chars=2)
-    if st.button("Pull app reviews", use_container_width=True, disabled=not (gp_id or as_id)):
-        msgs, fails = [], []
-        with st.spinner("Fetching app reviews..."):
-            if gp_id:
-                try:
-                    n = ingest(sources.fetch_google_play(gp_id, 200))
-                    (msgs if n else fails).append(f"Google Play {n}" if n else "Google Play (check the package id)")
-                except Exception:
-                    fails.append("Google Play (check the package id)")
-            if as_id:
-                try:
-                    n = ingest(sources.fetch_app_store(as_id, as_country.lower()))
-                    (msgs if n else fails).append(f"App Store {n}" if n else "App Store (check the app id)")
-                except Exception:
-                    fails.append("App Store (check the app id)")
-        if msgs:
-            st.success("New reviews: " + ", ".join(msgs))
-        if fails:
-            st.warning("No reviews from: " + ", ".join(fails))
+    st.markdown(
+        '<div style="max-width: 860px; margin: 0 auto;">'
+        '<div class="hero-title">Know exactly what your customers want.</div>'
+        '<div class="hero-sub">Feedback Agent listens everywhere your customers talk, '
+        'analyzes every mention, and hands you a prioritized roadmap for the week.</div>'
+        '</div>', unsafe_allow_html=True)
+    st.write("")
 
-st.sidebar.markdown('<div class="side-label">Import</div>', unsafe_allow_html=True)
-with st.sidebar.expander("Upload Excel / CSV"):
-    st.caption("Any file with a feedback or review text column. Date, rating and author are auto-detected.")
-    uploaded = st.file_uploader("Choose file", type=["xlsx", "xls", "csv"],
-                                label_visibility="collapsed")
-    if uploaded and st.button("Import file", use_container_width=True):
-        try:
-            n = ingest(sources.load_upload(uploaded))
-            st.success(f"Imported {n} items")
-        except Exception as e:
-            st.error(f"Could not read file: {e}")
+    f1, f2, f3 = st.columns(3)
+    f1.markdown(
+        '<div class="feature"><div class="feature-num">Listen</div>'
+        '<div class="feature-title">Every channel at once</div>'
+        '<div class="feature-body">Reddit, Hacker News, Bluesky, Google News, Stack Overflow, '
+        'Google Play and App Store reviews, plus your own Excel exports. All free, no API keys.</div></div>',
+        unsafe_allow_html=True)
+    f2.markdown(
+        '<div class="feature"><div class="feature-num">Analyze</div>'
+        '<div class="feature-title">Signal, not noise</div>'
+        '<div class="feature-body">Every mention is scored for sentiment, tagged with pain themes, '
+        'mapped to a journey stage, and off-topic posts are filtered out automatically.</div></div>',
+        unsafe_allow_html=True)
+    f3.markdown(
+        '<div class="feature"><div class="feature-num">Act</div>'
+        '<div class="feature-title">A roadmap for Monday</div>'
+        '<div class="feature-body">Pain themes ranked by volume, negativity and recency become a '
+        'prioritized Mon-Fri plan with owners and evidence quotes.</div></div>',
+        unsafe_allow_html=True)
+    st.write("")
 
-st.sidebar.divider()
-df = st.session_state.feedback
-st.sidebar.caption(f"{len(df)} mentions collected")
-if st.sidebar.button("Clear all data", use_container_width=True):
-    st.session_state.feedback = pd.DataFrame(columns=sources.COLUMNS)
-    st.session_state.ai_roadmap = None
-    st.rerun()
+    left, mid, right = st.columns([1, 2, 1])
+    with mid:
+        if ob["step"] == 1:
+            st.markdown('<div class="stepper"><b>1 Your brand</b> &nbsp;·&nbsp; 2 Confirm and launch</div>',
+                        unsafe_allow_html=True)
+            brand = st.text_input("Brand name or website",
+                                  placeholder="e.g. notion.so or Spotify",
+                                  help="We use this to search social channels and find your app store listings.")
+            if st.button("Set up tracking", type="primary", use_container_width=True,
+                         disabled=not brand):
+                with st.spinner("Finding your brand in both app stores..."):
+                    found = sources.find_apps(brand)
+                term = brand.strip()
+                for prefix in ("https://", "http://", "www."):
+                    term = term.removeprefix(prefix)
+                term = term.split("/")[0].split(".")[0] if "." in term.split("/")[0] and " " not in term else term
+                st.session_state.ob = {"step": 2, "brand": term.strip() or brand, "found": found}
+                st.rerun()
+
+            with st.expander("Have a feedback file instead?"):
+                st.caption("Skip setup and analyze an Excel/CSV export directly.")
+                up = st.file_uploader("Choose file", type=["xlsx", "xls", "csv"],
+                                      label_visibility="collapsed", key="ob_upload")
+                if up and st.button("Analyze file", use_container_width=True):
+                    try:
+                        n = ingest(sources.load_upload(up))
+                        st.session_state.config = {"keyword": up.name.rsplit(".", 1)[0],
+                                                   "sources": [], "limit": 50, "strict": False}
+                        st.session_state.pull_msg = f"Imported {n} items from {up.name}"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not read file: {e}")
+
+        else:  # step 2: confirm
+            found = ob.get("found", {"google_play": None, "app_store": None})
+            gp_m, as_m = found.get("google_play"), found.get("app_store")
+
+            st.markdown('<div class="stepper">1 Your brand &nbsp;·&nbsp; <b>2 Confirm and launch</b></div>',
+                        unsafe_allow_html=True)
+            st.markdown(f'<div class="section-title">Tracking '
+                        f'<span class="brand-chip">{html.escape(ob["brand"])}</span></div>'
+                        '<div class="section-cap">Here is what we found. Adjust anything, then launch.</div>',
+                        unsafe_allow_html=True)
+
+            st.markdown('<div class="side-label">App reviews</div>', unsafe_allow_html=True)
+            if gp_m:
+                st.markdown(f'<div class="store-hit">Google Play: {html.escape(gp_m["title"])} '
+                            f'by {html.escape(gp_m["developer"])}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="store-miss">No Google Play app found. '
+                            'Leave the id blank if there is none.</div>', unsafe_allow_html=True)
+            if as_m:
+                st.markdown(f'<div class="store-hit">App Store: {html.escape(as_m["title"])} '
+                            f'by {html.escape(as_m["developer"])}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="store-miss">No App Store app found. '
+                            'Leave the id blank if there is none.</div>', unsafe_allow_html=True)
+
+            c1, c2 = st.columns(2)
+            gp_id = c1.text_input("Google Play package id",
+                                  value=(gp_m or {}).get("id", ""),
+                                  placeholder="none found")
+            as_id = c2.text_input("App Store numeric id",
+                                  value=(as_m or {}).get("id", ""),
+                                  placeholder="none found")
+
+            st.markdown('<div class="side-label">Social channels</div>', unsafe_allow_html=True)
+            picked = st.multiselect("Social sources", SOCIAL_SOURCES,
+                                    default=["Reddit", "Hacker News", "Bluesky", "Google News"],
+                                    label_visibility="collapsed")
+
+            with st.expander("Advanced options"):
+                subreddit = st.text_input("Limit Reddit to subreddit (optional)",
+                                          placeholder=ob["brand"].lower())
+                limit = st.slider("Max mentions per source", 25, 100, 50, 25)
+                strict = st.toggle("Strict brand matching", value=True,
+                                   help="Drops posts that use your keyword as an ordinary word "
+                                        "instead of talking about the product.")
+                country = st.text_input("App Store country code", value="us", max_chars=2)
+
+            b1, b2 = st.columns([1, 2])
+            if b1.button("Back", use_container_width=True):
+                st.session_state.ob = {"step": 1}
+                st.rerun()
+            if b2.button("Start listening", type="primary", use_container_width=True,
+                         disabled=not (picked or gp_id or as_id)):
+                new_cfg = {
+                    "keyword": ob["brand"], "sources": picked,
+                    "gp_id": gp_id.strip(), "as_id": as_id.strip(),
+                    "subreddit": subreddit.strip(),
+                    "limit": limit,
+                    "strict": strict,
+                    "country": (country.strip().lower() or "us"),
+                }
+                with st.spinner(f"Listening for {ob['brand']} across "
+                                f"{len(picked) + bool(gp_id) + bool(as_id)} channels... "
+                                "(20-60 seconds)"):
+                    msg = pull_everything(new_cfg)
+                st.session_state.config = new_cfg
+                st.session_state.pull_msg = msg
+                st.rerun()
+
+    st.stop()
 
 # ------------------------------------------------------------------ header
 
@@ -297,22 +431,12 @@ st.markdown(
     '<div class="app-sub">Listen everywhere your customers talk. Know exactly what to build next.</div>'
     '</div>', unsafe_allow_html=True)
 
+if st.session_state.pull_msg:
+    st.toast(st.session_state.pull_msg)
+    st.session_state.pull_msg = None
+
 if df.empty:
-    st.markdown(f"""
-<div class="card" style="max-width:720px;">
-  <div class="section-title">Start listening in three steps</div>
-  <div class="empty-step"><div class="step-num">1</div><div>
-    <b>Track a brand</b> - type a product keyword in the sidebar and pull mentions from
-    Reddit, Hacker News, Bluesky, Google News and Stack Overflow.</div></div>
-  <div class="empty-step"><div class="step-num">2</div><div>
-    <b>Add app reviews</b> - pull live reviews from Google Play
-    (e.g. <code>com.spotify.music</code>) and the App Store (e.g. <code>324684580</code>).</div></div>
-  <div class="empty-step"><div class="step-num">3</div><div>
-    <b>Or upload your own</b> - drop in any Excel/CSV export of customer feedback,
-    support tickets or NPS comments.</div></div>
-  <div class="section-cap" style="margin-top:12px;">Every mention is scored for sentiment,
-  tagged with pain themes and mapped to a customer-journey stage. No API keys needed.</div>
-</div>""", unsafe_allow_html=True)
+    st.info("No mentions collected yet. Use Refresh data in the sidebar, or track a different brand.")
     st.stop()
 
 tab_dash, tab_roadmap, tab_mentions = st.tabs(["Dashboard", "Weekly Roadmap", "Mentions"])
