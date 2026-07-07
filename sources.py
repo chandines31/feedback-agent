@@ -386,3 +386,85 @@ def fetch_stackoverflow(query: str, limit: int = 50) -> pd.DataFrame:
             "url": it.get("link", ""),
         })
     return pd.DataFrame(rows, columns=COLUMNS) if rows else _empty()
+
+# ----------------------------------------------------------- App id discovery
+
+def _play_top_id(term: str) -> str | None:
+    """First app id on the Play Store search results page for a term."""
+    try:
+        resp = requests.get("https://play.google.com/store/search",
+                            params={"q": term, "c": "apps"},
+                            headers={"User-Agent": _BROWSER_UA}, timeout=15)
+        resp.raise_for_status()
+        m = re.search(r"/store/apps/details\?id=([\w.]+)", resp.text)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def find_apps(brand: str, country: str = "us") -> dict:
+    """Guess a brand's Google Play and App Store apps from a name or website URL.
+
+    Returns {"google_play": {id, title, developer} | None,
+             "app_store":  {id, title, developer} | None}
+    """
+    term = brand.strip()
+    term = re.sub(r"^https?://", "", term)
+    term = re.sub(r"^www\.", "", term)
+    if "/" in term:
+        term = term.split("/")[0]
+    if "." in term and " " not in term:
+        term = term.split(".")[0]  # notion.so -> notion
+
+    out = {"google_play": None, "app_store": None}
+
+    low = term.lower()
+
+    def installs_num(s: str) -> int:
+        return int(re.sub(r"\D", "", s or "") or 0)
+
+    try:
+        from google_play_scraper import search as gp_search
+        raw = gp_search(term, lang="en", country=country, n_hits=8)
+        hits = [h for h in raw
+                if h.get("appId") and low in (h.get("title") or "").lower()]
+        # the brand's main app is almost always the most-installed match
+        hits.sort(key=lambda h: installs_num(h.get("installs", "")), reverse=True)
+        # the library often fails to parse the id of Play's top "hero" result,
+        # which is usually the brand's main app: recover it from the search page
+        hero = raw[0] if raw else None
+        if hero and not hero.get("appId") and low in (hero.get("title") or "").lower():
+            hero_id = _play_top_id(term)
+            if hero_id:
+                hits.insert(0, {**hero, "appId": hero_id})
+        if hits:
+            h = hits[0]
+            out["google_play"] = {
+                "id": h["appId"],
+                "title": h.get("title") or "",
+                "developer": h.get("developer") or "",
+            }
+    except Exception:
+        pass
+
+    try:
+        resp = requests.get(
+            "https://itunes.apple.com/search",
+            params={"term": term, "entity": "software", "limit": 5, "country": country},
+            headers={"User-Agent": USER_AGENT}, timeout=15,
+        )
+        resp.raise_for_status()
+        results = [r for r in resp.json().get("results", [])
+                   if low in (r.get("trackName") or "").lower()
+                   or low in (r.get("sellerName") or "").lower()]
+        if results:
+            r = results[0]
+            out["app_store"] = {
+                "id": str(r.get("trackId", "")),
+                "title": r.get("trackName", ""),
+                "developer": r.get("sellerName", ""),
+            }
+    except Exception:
+        pass
+
+    return out

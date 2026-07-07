@@ -162,6 +162,9 @@ def ingest(df: pd.DataFrame) -> int:
     """Analyze and merge new feedback; returns number of new rows kept."""
     if df.empty:
         return 0
+    # sources mix tz-naive and tz-aware datetimes; normalize to UTC
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     df = add_journey(add_themes(add_sentiment(df)))
     before = len(st.session_state.feedback)
     combined = pd.concat([st.session_state.feedback, df], ignore_index=True)
@@ -212,9 +215,26 @@ if st.sidebar.button("Pull social mentions", type="primary",
 
 st.sidebar.markdown('<div class="side-label">App store reviews</div>', unsafe_allow_html=True)
 with st.sidebar.expander("Google Play and App Store"):
-    gp_id = st.text_input("Google Play package id", placeholder="com.notion.id",
+    brand_q = st.text_input("Brand name or website", placeholder="notion.so",
+                            help="Type the product name or its website and the app ids are looked up for you.")
+    if st.button("Find app ids", use_container_width=True, disabled=not brand_q):
+        with st.spinner("Searching both app stores..."):
+            found = sources.find_apps(brand_q)
+        st.session_state["gp_id"] = (found["google_play"] or {}).get("id", "")
+        st.session_state["as_id"] = (found["app_store"] or {}).get("id", "")
+        st.session_state["app_matches"] = found
+
+    matches = st.session_state.get("app_matches")
+    if matches:
+        gp_m, as_m = matches["google_play"], matches["app_store"]
+        st.caption("Google Play: " + (f"{gp_m['title']} by {gp_m['developer']}" if gp_m else "no app found"))
+        st.caption("App Store: " + (f"{as_m['title']} by {as_m['developer']}" if as_m else "no app found"))
+        if gp_m or as_m:
+            st.caption("Check the ids below look right, then pull.")
+
+    gp_id = st.text_input("Google Play package id", key="gp_id", placeholder="notion.id",
                           help="From the Play Store URL: play.google.com/store/apps/details?id=<this>")
-    as_id = st.text_input("App Store numeric id", placeholder="1232780281",
+    as_id = st.text_input("App Store numeric id", key="as_id", placeholder="1232780281",
                           help="The number in the App Store URL: apps.apple.com/us/app/.../id<this>")
     as_country = st.text_input("Country code", value="us", max_chars=2)
     if st.button("Pull app reviews", use_container_width=True, disabled=not (gp_id or as_id)):
@@ -222,18 +242,20 @@ with st.sidebar.expander("Google Play and App Store"):
         with st.spinner("Fetching app reviews..."):
             if gp_id:
                 try:
-                    msgs.append(f"Google Play {ingest(sources.fetch_google_play(gp_id, 200))}")
+                    n = ingest(sources.fetch_google_play(gp_id, 200))
+                    (msgs if n else fails).append(f"Google Play {n}" if n else "Google Play (check the package id)")
                 except Exception:
-                    fails.append("Google Play")
+                    fails.append("Google Play (check the package id)")
             if as_id:
                 try:
-                    msgs.append(f"App Store {ingest(sources.fetch_app_store(as_id, as_country.lower()))}")
+                    n = ingest(sources.fetch_app_store(as_id, as_country.lower()))
+                    (msgs if n else fails).append(f"App Store {n}" if n else "App Store (check the app id)")
                 except Exception:
-                    fails.append("App Store")
+                    fails.append("App Store (check the app id)")
         if msgs:
             st.success("New reviews: " + ", ".join(msgs))
         if fails:
-            st.warning("No data from: " + ", ".join(fails))
+            st.warning("No reviews from: " + ", ".join(fails))
 
 st.sidebar.markdown('<div class="side-label">Import</div>', unsafe_allow_html=True)
 with st.sidebar.expander("Upload Excel / CSV"):
