@@ -4,11 +4,27 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from functools import lru_cache
 
 import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 _analyzer = SentimentIntensityAnalyzer()
+
+
+@lru_cache(maxsize=4096)
+def _kw_pattern(kw: str) -> re.Pattern:
+    """Word-boundary pattern for a keyword or phrase.
+
+    Substring matching mis-tags short keys badly ('ui' inside 'building',
+    'ad' inside 'adaptation'), so every keyword match is boundary-checked.
+    """
+    esc = re.escape(kw.strip().lower()).replace(r"\ ", r"\s+").replace(" ", r"\s+")
+    return re.compile(rf"(?<![a-z0-9]){esc}(?![a-z0-9])")
+
+
+def _kw_in(low: str, kw: str) -> bool:
+    return bool(_kw_pattern(kw).search(low))
 
 # Theme keyword map: a hit on any keyword tags the feedback with that theme.
 THEMES = {
@@ -106,9 +122,9 @@ def add_journey(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     def detect(row) -> str:
-        low = " " + str(row["text"]).lower() + " "
+        low = str(row["text"]).lower()
         for stage, kws in JOURNEY_STAGES.items():
-            if any(k in low for k in kws):
+            if any(_kw_in(low, k) for k in kws):
                 return stage
         # A store review with a rating is first-hand experience by definition
         if row["source"] in _EXPERIENCE_SOURCES or pd.notna(row.get("rating")):
@@ -136,8 +152,9 @@ def add_themes(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     def detect(text: str) -> str:
-        low = " " + str(text).lower() + " "
-        hits = [theme for theme, kws in THEMES.items() if any(k in low for k in kws)]
+        low = str(text).lower()
+        hits = [theme for theme, kws in THEMES.items()
+                if any(_kw_in(low, k) for k in kws)]
         return ", ".join(hits) if hits else "Other"
 
     df["themes"] = df["text"].map(detect)
@@ -183,7 +200,13 @@ PRODUCT_CONTEXT = [
     "integration", "database", "review", "alternative", "alternatives",
     "vs", "versus", "saas", "startup", "user", "users", "free tier",
     "premium", "browser", "extension", "export", "import", "beta",
+    # hardware brands (HP, Dell, Logitech, ...)
+    "laptop", "printer", "computer", "monitor", "keyboard", "ink",
+    "cartridge", "device", "warranty", "driver", "firmware", "bios",
+    "charger", "repair", "customer service", "model",
 ]
+
+_CTX_ALT = "|".join(re.escape(w).replace(r"\ ", r"\s+") for w in PRODUCT_CONTEXT)
 
 # Determiner + brand means the word is being used generically:
 # "the notion of", "no notion that", "some notion about"
@@ -200,47 +223,83 @@ def _theme_words() -> set[str]:
 _THEME_WORDS = _theme_words()
 
 
+def _generic_patterns(b: str) -> str:
+    """Regex alternatives for the keyword used as plain English, not a brand:
+    'the notion of', 'a lot of hp', '800 hp', 'no notion that'."""
+    return "|".join([
+        rf"\b{_GENERIC_DETERMINERS}\s+{b}\s+(of|that|to|about)\b",   # the notion of
+        rf"\b{_GENERIC_DETERMINERS}\s+{b}(?!\s*[a-z0-9])",           # a notion. / any hp,
+        rf"\b{b}\s+(of|that|to)\b",                                  # notion that ...
+        rf"(\d+\s*|lots?\s+of\s+|much\s+|more\s+|less\s+|extra\s+"   # 800 hp / lot of hp
+        rf"|enough\s+|max\s+|full\s+|high\s+|low\s+){b}(?![a-z0-9])",
+    ])
+
+
 def _brand_relevance(text: str, brand: str, url: str = "") -> tuple[int, bool]:
     """Score how likely a text is about the brand rather than the English word.
 
     Returns (score, has_brand_signal). Brand signals are usages that only make
-    sense for the product: its domain, its name as a proper noun, or a link
-    into its own community (e.g. reddit.com/r/notion).
+    sense for the product: its domain, a link into its own community, its name
+    as a proper noun, or the name right next to product vocabulary ("hp printer").
     """
-    low = " " + text.lower() + " "
+    low = text.lower()
+    brand = brand.strip()
     b = re.escape(brand.lower())
+    short = len(brand) <= 3  # hp, arc, bee: capitalization means nothing
     score = 0
     brand_signal = False
 
     # the brand's website is the strongest possible signal
-    if re.search(rf"\b{b}\.(so|com|io|app|ai|co|dev|org)\b", low):
+    if re.search(rf"(?<![a-z0-9]){b}\.(so|com|io|app|ai|co|dev|org)\b", low):
         score += 2
         brand_signal = True
 
-    # link into the brand's own community or store page
-    if url and brand.lower() in url.lower():
+    # link into the brand's own community or store page (token match, not
+    # substring: 'hp' inside 'watchparty' must not count)
+    if url and re.search(rf"(?<![a-z0-9]){b}(?![a-z0-9])", url.lower()):
         score += 2
         brand_signal = True
 
-    # brand written as a proper noun (capitalized) in or at the start of a sentence
-    cap = " ".join(p.capitalize() for p in brand.split())
-    for m in re.finditer(rf"\b{re.escape(cap)}\b", text):
-        prev = text[:m.start()].rstrip()
-        if not prev or prev[-1] not in ".!?\"'“”‘’:;([-":
+    # brand written as a proper noun mid-sentence. Skipped for very short
+    # brands: gamers write "5000 HP" for hit points, drivers "800 HP".
+    if not short:
+        cap = " ".join(p.capitalize() for p in brand.split())
+        for m in re.finditer(rf"\b{re.escape(cap)}\b", text):
+            prev = text[:m.start()].rstrip()
+            if not prev or prev[-1] not in ".!?\"'“”‘’:;([-":
+                score += 1
+                brand_signal = True
+                break
+
+    # brand adjacent to product vocabulary ("hp printer", "the Notion app")
+    if re.search(rf"(?<![a-z0-9]){b}(?![a-z0-9])[^.!?\n]{{0,40}}(?<![a-z0-9])({_CTX_ALT})(?![a-z0-9])", low) or \
+       re.search(rf"(?<![a-z0-9])({_CTX_ALT})(?![a-z0-9])[^.!?\n]{{0,40}}(?<![a-z0-9]){b}(?![a-z0-9])", low):
+        score += 1
+        brand_signal = True
+
+    # brand followed by a capitalized model name ("HP Spectre", "Notion Calendar")
+    _not_models = {"i", "the", "a", "an", "it", "he", "she", "they", "we", "you",
+                   "this", "that", "if", "but", "and", "or", "so", "my", "is"}
+    for m in re.finditer(rf"(?<![A-Za-z0-9]){b}(?![A-Za-z0-9])", text, re.IGNORECASE):
+        nxt = re.match(r"\s+([A-Z][A-Za-z0-9']*)", text[m.end():])  # case-sensitive
+        if nxt and nxt.group(1).lower() not in _not_models:
             score += 1
             brand_signal = True
             break
 
-    # product vocabulary nearby
-    if any(re.search(rf"\b{re.escape(w)}\b", low) for w in PRODUCT_CONTEXT):
+    # product vocabulary anywhere in the text
+    if any(_kw_in(low, w) for w in PRODUCT_CONTEXT):
         score += 1
 
     # feedback vocabulary (crash, slow, refund, ...) implies product talk
-    if any(w in low for w in _THEME_WORDS):
+    if any(_kw_in(low, w) for w in _THEME_WORDS):
         score += 1
 
-    # generic-English usage patterns count against
-    if re.search(rf"\b{_GENERIC_DETERMINERS}\s+{b}\b", low):
+    # generic-English usage patterns count against, quantities most of all
+    if re.search(rf"(\d+\s*|lots?\s+of\s+|much\s+|more\s+|less\s+|extra\s+"
+                 rf"|enough\s+|max\s+|full\s+|high\s+|low\s+){b}(?![a-z0-9])", low):
+        score -= 3
+    if re.search(rf"\b{_GENERIC_DETERMINERS}\s+{b}\s+(of|that|to|about)\b", low):
         score -= 2
     if re.search(rf"\b{b}\s+(of|that|to)\b", low):
         score -= 1
@@ -267,11 +326,12 @@ def filter_brand_mentions(df: pd.DataFrame, brand: str):
     ]
 
     # How often is the keyword used as plain English in this batch?
-    generic_pat = rf"\b{_GENERIC_DETERMINERS}\s+{b}\b|\b{b}\s+(of|that|to)\b"
+    generic_pat = _generic_patterns(b)
     generic_share = df["text"].astype(str).map(
         lambda t: bool(re.search(generic_pat, t.lower()))).mean()
     signal_share = sum(1 for _, sig in scored if sig) / len(scored)
-    ambiguous = generic_share > 0.12 or signal_share < 0.15
+    # very short keywords (hp, arc) collide with too many things: always strict
+    ambiguous = len(brand) <= 3 or generic_share > 0.12 or signal_share < 0.15
 
     if ambiguous:
         mask = pd.Series([s >= 2 and sig for s, sig in scored], index=df.index)
