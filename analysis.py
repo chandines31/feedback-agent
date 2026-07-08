@@ -307,17 +307,20 @@ def _brand_relevance(text: str, brand: str, url: str = "") -> tuple[int, bool]:
     return score, brand_signal
 
 
-def filter_brand_mentions(df: pd.DataFrame, brand: str):
-    """Split fetched mentions into (relevant, dropped_count) for a brand keyword.
+def triage_brand_mentions(df: pd.DataFrame, brand: str):
+    """Three-way split of fetched mentions for a brand keyword:
+    (definitely_relevant, borderline, dropped_count).
 
     Adaptive strictness: when the corpus shows the keyword being used as an
-    ordinary English word (like "notion"), require a real brand signal and a
-    higher score. Unambiguous brands (like "spotify") pass with a light touch.
-    App store reviews are on-brand by definition; do not pass them through.
+    ordinary English word (like "notion" or "hp"), a real brand signal and a
+    higher score are required. Borderline items are the ones worth escalating
+    to an LLM when a key is available; without one, resolve_borderline()
+    applies the heuristic decision. App store reviews are on-brand by
+    definition; do not pass them through.
     """
     brand = brand.strip()
     if df.empty or not brand:
-        return df, 0
+        return df, df.iloc[0:0], 0
 
     b = re.escape(brand.lower())
     scored = [
@@ -333,8 +336,52 @@ def filter_brand_mentions(df: pd.DataFrame, brand: str):
     # very short keywords (hp, arc) collide with too many things: always strict
     ambiguous = len(brand) <= 3 or generic_share > 0.12 or signal_share < 0.15
 
-    if ambiguous:
-        mask = pd.Series([s >= 2 and sig for s, sig in scored], index=df.index)
-    else:
-        mask = pd.Series([s >= 1 for s, _ in scored], index=df.index)
-    return df[mask].reset_index(drop=True), int((~mask).sum())
+    keeps, borders, drops = [], [], []
+    for idx, (s, sig) in zip(df.index, scored):
+        if ambiguous:
+            if s >= 3 and sig:
+                keeps.append(idx)
+            elif s < 0:
+                drops.append(idx)
+            else:
+                borders.append(idx)
+        else:
+            if s >= 2:
+                keeps.append(idx)
+            elif s < 0:
+                drops.append(idx)
+            else:
+                borders.append(idx)
+
+    meta = {"ambiguous": ambiguous,
+            "scores": {i: sc for i, sc in zip(df.index, scored)}}
+    keep_df = df.loc[keeps]
+    border_df = df.loc[borders].copy()
+    border_df.attrs["triage"] = meta
+    return keep_df, border_df, len(drops)
+
+
+def resolve_borderline(border_df: pd.DataFrame) -> pd.DataFrame:
+    """Heuristic fallback for borderline mentions when no LLM is available."""
+    if border_df.empty:
+        return border_df
+    meta = border_df.attrs.get("triage", {"ambiguous": True, "scores": {}})
+    scores = meta["scores"]
+
+    def keep(idx) -> bool:
+        s, sig = scores.get(idx, (0, False))
+        if meta["ambiguous"]:
+            return s >= 2 and sig
+        return s >= 1
+
+    mask = pd.Series([keep(i) for i in border_df.index], index=border_df.index)
+    return border_df[mask]
+
+
+def filter_brand_mentions(df: pd.DataFrame, brand: str):
+    """Heuristic-only filter: (relevant, dropped_count). Used when no API key
+    is configured, and by tests."""
+    keep_df, border_df, dropped = triage_brand_mentions(df, brand)
+    resolved = resolve_borderline(border_df)
+    kept = pd.concat([keep_df, resolved]).sort_index().reset_index(drop=True)
+    return kept, dropped + (len(border_df) - len(resolved))

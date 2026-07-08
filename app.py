@@ -22,8 +22,8 @@ import streamlit as st
 
 import sources
 from analysis import (JOURNEY_ORDER, add_journey, add_sentiment, add_themes,
-                      filter_brand_mentions, journey_summary, theme_summary,
-                      top_terms)
+                      journey_summary, resolve_borderline, theme_summary,
+                      top_terms, triage_brand_mentions)
 from roadmap import build_roadmap
 
 st.set_page_config(page_title="Feedback Agent", page_icon="📡", layout="wide")
@@ -195,8 +195,23 @@ def ingest(df: pd.DataFrame) -> int:
     return len(combined) - before
 
 
+def get_api_key() -> str:
+    """API key from the roadmap tab input, environment, or Streamlit secrets."""
+    try:
+        secret_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        secret_key = ""
+    return (st.session_state.get("api_key") or
+            os.environ.get("ANTHROPIC_API_KEY", "") or secret_key)
+
+
 def pull_everything(cfg: dict) -> str:
-    """Pull all configured channels (social + app stores). Returns a summary."""
+    """Pull all configured channels (social + app stores). Returns a summary.
+
+    Relevance runs in two stages: heuristics decide the clear-cut mentions
+    for free; the ambiguous rest goes to one batched AI call per pull when
+    an API key is available (rule-based fast path + batched LLM escalation).
+    """
     kw = cfg["keyword"]
     fetchers = {
         "Reddit": lambda: sources.fetch_reddit(kw, cfg["limit"], cfg.get("subreddit", "")),
@@ -205,16 +220,48 @@ def pull_everything(cfg: dict) -> str:
         "Google News": lambda: sources.fetch_google_news(kw, cfg["limit"]),
         "Stack Overflow": lambda: sources.fetch_stackoverflow(kw, cfg["limit"]),
     }
-    results, failures, off_topic = [], [], 0
+    api_key = get_api_key()
+    use_ai = cfg.get("ai_precision", True) and bool(api_key)
+
+    results, failures, off_topic, ai_checked = [], [], 0, 0
+    batches = []  # (source_name, keep_df, border_df)
+    offset = 0    # keep indices unique across sources so AI verdicts map back
     for name in cfg["sources"]:
         try:
-            fetched = fetchers[name]()
+            fetched = fetchers[name]().reset_index(drop=True)
+            fetched.index = fetched.index + offset
+            offset += len(fetched)
             if cfg.get("strict", True):
-                fetched, dropped = filter_brand_mentions(fetched, kw)
+                keep_df, border_df, dropped = triage_brand_mentions(fetched, kw)
                 off_topic += dropped
-            results.append(f"{name} {ingest(fetched)}")
+                batches.append((name, keep_df, border_df))
+            else:
+                batches.append((name, fetched, fetched.iloc[0:0]))
         except Exception:
             failures.append(name)
+
+    # resolve all borderline mentions across sources in ONE batched AI call
+    borders = pd.concat([b for _, _, b in batches]) if batches else pd.DataFrame()
+    verdicts = {}
+    if use_ai and len(borders) > 0:
+        from ai_relevance import MAX_BATCH, verify_relevance
+        sample = borders.head(MAX_BATCH)
+        try:
+            flags = verify_relevance(sample["text"].astype(str).tolist(),
+                                     kw, cfg.get("product_hint", ""), api_key)
+            verdicts = dict(zip(sample.index, flags))
+            ai_checked = len(sample)
+        except Exception:
+            verdicts = {}  # API failed: heuristics take over below
+
+    for name, keep_df, border_df in batches:
+        if verdicts and not border_df.empty:
+            accepted = border_df[[verdicts.get(i, False) for i in border_df.index]]
+            off_topic += len(border_df) - len(accepted)
+        else:
+            accepted = resolve_borderline(border_df)
+            off_topic += len(border_df) - len(accepted)
+        results.append(f"{name} {ingest(pd.concat([keep_df, accepted]))}")
     if cfg.get("gp_id"):
         try:
             n = ingest(sources.fetch_google_play(cfg["gp_id"], 200))
@@ -229,8 +276,13 @@ def pull_everything(cfg: dict) -> str:
             failures.append("App Store")
 
     msg = "New mentions: " + ", ".join(results) if results else "No new mentions found"
+    extras = []
     if off_topic:
-        msg += f" ({off_topic} off-topic dropped)"
+        extras.append(f"{off_topic} off-topic dropped")
+    if ai_checked:
+        extras.append(f"{ai_checked} AI-verified")
+    if extras:
+        msg += f" ({', '.join(extras)})"
     if failures:
         msg += ". No data from: " + ", ".join(failures)
     return msg
@@ -396,6 +448,10 @@ if df.empty and not cfg:
                 strict = st.toggle("Strict brand matching", value=True,
                                    help="Drops posts that use your keyword as an ordinary word "
                                         "instead of talking about the product.")
+                ai_precision = st.toggle("AI precision filter", value=True,
+                                         help="When an API key is set (secrets or the Roadmap tab), "
+                                              "ambiguous mentions get a final relevance check in one "
+                                              "batched AI call per pull. Without a key this has no effect.")
                 country = st.text_input("App Store country code", value="us", max_chars=2)
 
             b1, b2 = st.columns([1, 2])
@@ -404,13 +460,17 @@ if df.empty and not cfg:
                 st.rerun()
             if b2.button("Start listening", type="primary", use_container_width=True,
                          disabled=not (picked or gp_id or as_id)):
+                hint_parts = [f"{m['title']} by {m['developer']}"
+                              for m in (gp_m, as_m) if m]
                 new_cfg = {
                     "keyword": ob["brand"], "sources": picked,
                     "gp_id": gp_id.strip(), "as_id": as_id.strip(),
                     "subreddit": subreddit.strip(),
                     "limit": limit,
                     "strict": strict,
+                    "ai_precision": ai_precision,
                     "country": (country.strip().lower() or "us"),
+                    "product_hint": "; ".join(dict.fromkeys(hint_parts)),
                 }
                 with st.spinner(f"Listening for {ob['brand']} across "
                                 f"{len(picked) + bool(gp_id) + bool(as_id)} channels... "
@@ -611,8 +671,9 @@ with tab_roadmap:
     except Exception:
         secret_key = ""
     default_key = os.environ.get("ANTHROPIC_API_KEY", "") or secret_key
-    api_key = st.text_input("API key", value=default_key, type="password",
-                            help="Get one at console.anthropic.com, or set ANTHROPIC_API_KEY in Streamlit secrets.")
+    api_key = st.text_input("API key", value=default_key, type="password", key="api_key",
+                            help="Also unlocks the AI precision filter on every pull. "
+                                 "Get one at console.anthropic.com, or set ANTHROPIC_API_KEY in Streamlit secrets.")
 
     if st.button("Generate AI roadmap", type="primary", disabled=not (api_key and items)):
         from roadmap import generate_ai_roadmap

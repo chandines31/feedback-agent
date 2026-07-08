@@ -36,6 +36,14 @@ Account, Feature Requests, Customer Support, Ads & Notifications) and mapped to
 a **customer-journey stage** (Awareness, Solution Search, Comparison, Purchase
 Decision, Experience & Advocacy).
 
+**Relevance runs in two stages.** Rule-based scoring decides the clear-cut
+mentions for free: brand domain, community links, proper-noun usage and
+product vocabulary count for a mention; generic English patterns ("the notion
+of", "800 hp") count against it. The ambiguous rest is escalated to **one
+batched AI call per pull** for a final verdict when an API key is set, so
+tagging stays fast and cheap while catching nuance. Without a key the
+heuristics decide everything.
+
 **Dashboard**: KPI cards (mentions 28d with trend, avg sentiment 0-100,
 negative share, avg rating, channels tracked), customer journey funnel,
 pain-theme map, sentiment over time, mentions by source.
